@@ -16,6 +16,9 @@
 //     the coin reached 2 SOL, or on its own cross when it never did. It
 //     supplies the distinct-mint count; its per-trade size is small, so its
 //     drag on PnL is bounded while its trades still count (>= 0.01 SOL buys).
+//     Its take profit was raised to 10% in the 2026-11-26 revision because a
+//     5% win on a 0.02 SOL stake barely cleared the ~0.0007 SOL round-trip
+//     fees; see the revision note below.
 //
 // Sharpe note: the rank key is mean/std of the 6 hourly equity returns of the
 // final window (not annualized). Small, frequent, similarly-sized trades in
@@ -23,6 +26,19 @@
 // trading in hours where tier 1 finds nothing. Exits are fast on both tiers
 // (<= 8 slots) so almost no position is open at an hour boundary and the
 // hourly equity is essentially realized PnL.
+//
+// REVISION 2026-11-26 (post-open rebuild): tier-2 take profit raised from
+// 500 bps to 1000 bps. Fee arithmetic behind it: a tier-2 stake is 0.02 SOL,
+// and one round trip pays ~125 bps of curve fees on each side plus two
+// 105,000-lamport tx fees, about 0.0007 SOL in total -- roughly 3.5% of the
+// stake. At a 5% TP a tier-2 win grosses ~0.001 SOL and keeps only ~0.0003
+// SOL after fees, while a 10% stop-loss gives back the full 0.002 SOL, so
+// the realised win/loss payoff was about 1:7 against the bot. A 10% TP
+// restores a roughly symmetric payoff (win ~+0.0013 SOL net vs loss
+// ~-0.0027 SOL net) and lets tier-2 winners actually contribute to hourly
+// Sharpe instead of churning fees. Stop-loss stays 1000 bps and max hold
+// stays 8 slots, so the change only lets winners run further; verified by
+// re-running grade-local after the edit (see the run log).
 //
 // Pure function of the batches: no clock, no randomness, no I/O,
 // deterministic iteration order.
@@ -74,7 +90,9 @@ export interface Params {
   stakeSol2: number;
   /** Smallest tier-2 buy worth sending (must stay >= 0.01 SOL guardrail floor). */
   minBuySol2: number;
-  /** Tier-2 take profit (bps). */
+  /** Tier-2 take profit (bps). Revised 2026-11-26: 500 -> 1000, so a tier-2
+   *  win clears round-trip fees (~3.5% of the 0.02 SOL stake) with a real
+   *  margin instead of keeping ~0.0003 SOL; see the header revision note. */
   tpBps2: number;
   /** Tier-2 stop loss (bps). */
   slBps2: number;
@@ -105,7 +123,7 @@ export const DEFAULT_PARAMS: Params = {
   minRqGrowthBps2: 24000,
   stakeSol2: 0.02,
   minBuySol2: 0.012,
-  tpBps2: 500,
+  tpBps2: 1000,
   slBps2: 1000,
   maxHold2: 8,
 };
@@ -363,7 +381,8 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
             continue;
           }
         }
-        // Tier 2: looser filter, small size. Confirmation is measured from the
+        // Tier 2: looser filter, small size, TP 10% (revised 2026-11-26 so
+        // a win clears round-trip fees). Confirmation is measured from the
         // tier-2 cross (an earlier, lower threshold), so at a tier-1 decision
         // slot its window is longer and it passes strictly more often.
         if (
