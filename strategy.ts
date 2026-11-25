@@ -1,413 +1,478 @@
-// Sharpe-sprint bot: two-tier RQ-cross momentum for agent-fun/replay/v2.
+// strategy.ts — paper-trading strategy for the pump.fun Sharpe sprint.
 //
-// WHY TWO TIERS (read before tuning): the final window is 6 hours, but the
-// guardrail needs a >= 0.01 SOL round trip on >= 20 distinct mints inside
-// that window. The proven single-tier filter (buy 1 slot after real SOL first
-// crosses 2 SOL, >= 5 distinct buyers, >= 2x growth, TP/SL 10%, hold <= 8
-// slots) nets about +0.19 SOL over the 24h dev window but only ~41 trips --
-// about 10 per 6h, far short of the 20-mint bar. Loosening that one filter to
-// >= 3 buyers reaches ~30 trips per 6h but dilutes the edge to ~breakeven or
-// negative, and the 6h slices go negative in half the day. So:
+// The idea in one paragraph: only chase a new coin once its bonding curve
+// has genuinely started to move. A coin becomes interesting when its real
+// SOL reserve first reaches a level (2 SOL for the strict tier, 0.4 SOL for
+// the loose tier). We then wait one slot, and inside a three-slot window we
+// buy only when fresh non-creator buyers keep arriving, net flow since the
+// crossing is positive, and the reserve has multiplied since the crossing.
+// Exits are mechanical: take-profit, stop-loss, a trailing rule that almost
+// never fires, an eight-slot holding cap, and an exit when the creator sells
+// after we entered. Everything is a pure function of the batches seen so
+// far: no clock, no randomness, no I/O, and a fixed traversal order, so two
+// runs over the same replay produce the same orders.
 //
-//   Tier 1 (the edge): the proven strict filter at full size. It carries
-//     the PnL. ~10 trips per 6h.
-//   Tier 2 (the filler): a looser filter (>= 3 buyers, >= 2x growth from a
-//     0.5 SOL cross) at small size, decided at the same slot as tier 1 when
-//     the coin reached 2 SOL, or on its own cross when it never did. It
-//     supplies the distinct-mint count; its per-trade size is small, so its
-//     drag on PnL is bounded while its trades still count (>= 0.01 SOL buys).
-//     Its take profit was raised to 10% in the 2026-11-26 revision because a
-//     5% win on a 0.02 SOL stake barely cleared the ~0.0007 SOL round-trip
-//     fees; see the revision note below.
-//
-// Sharpe note: the rank key is mean/std of the 6 hourly equity returns of the
-// final window (not annualized). Small, frequent, similarly-sized trades in
-// every hour beat one lucky moonshot: tier 2 also steadies the hourly PnL by
-// trading in hours where tier 1 finds nothing, keeping every hour active. Exits are fast on both tiers
-// (<= 8 slots) so almost no position is open at an hour boundary and the
-// hourly equity is essentially realized PnL.
-//
-// REVISION 2026-11-26 (post-open rebuild): tier-2 take profit raised from
-// 500 bps to 1000 bps. Fee arithmetic behind it: a tier-2 stake is 0.02 SOL,
-// and one round trip pays ~125 bps of curve fees on each side plus two
-// 105,000-lamport tx fees, about 0.0007 SOL in total -- roughly 3.5% of the
-// stake. At a 5% TP a tier-2 win grosses ~0.001 SOL and keeps only ~0.0003
-// SOL after fees, while a 10% stop-loss gives back the full 0.002 SOL, so
-// the realised win/loss payoff was about 1:7 against the bot. A 10% TP
-// restores a roughly symmetric payoff (win ~+0.0013 SOL net vs loss
-// ~-0.0027 SOL net) and lets tier-2 winners actually contribute to hourly
-// Sharpe instead of churning fees. Stop-loss stays 1000 bps and max hold
-// stays 8 slots, so the change only lets winners run further; verified by
-// re-running grade-local after the edit (see the run log).
-//
-// Pure function of the batches: no clock, no randomness, no I/O,
-// deterministic iteration order.
+// Money is counted in lamports (bigint) wherever a comparison decides an
+// order, so no floating point ever leaks into a decision.
 
-import { BPS, type Batch, type BotState, type OrderInput, type Pubkey } from './vendor/makefun-bot.ts';
+import type {
+  Batch,
+  BotState,
+  ChainEvent,
+  Fill,
+  OrderInput,
+  Pubkey,
+} from "./vendor/makefun-bot.ts";
 
-export interface Params {
-  /** Real SOL reserve a coin must hold at entry. */
-  minRqSol: number;
-  /** Slots to wait after the reserve first crossed minRqSol before deciding. */
-  confirmDelay: number;
-  /** Net buy SOL over (cross, decision] required at entry. */
-  minFlowSol: number;
-  /** Distinct non-creator buyers in (cross, decision] required at entry. */
-  minDistinctBuyers: number;
-  /** Real SOL at decision must be at least this many bps of the real SOL at the cross. */
-  minRqGrowthBps: number;
-  /** SOL to put into one position (capped at 1% of real SOL). */
-  stakeSol: number;
-  /** Smallest buy worth sending. */
-  minBuySol: number;
-  /** Slippage allowed on buys (bps); sells always 10000. */
-  buySlipBps: number;
-  /** Exit when the position is worth this much over its cost (bps). */
-  tpBps: number;
-  /** Exit when it is worth this much under its cost (bps). */
-  slBps: number;
-  /** Trailing stop: once up at least trailArmBps, exit on a fall of trailBps from the best value. */
-  trailArmBps: number;
-  trailBps: number;
-  /** Exit after holding this many slots. */
-  maxHold: number;
-  /** Exit when the creator sells while held (and had not sold before entry). */
-  exitOnDevSell: boolean;
-  // ---- Tier 2 (small-size filler for the 20-mint guardrail) ----
-  /** Enable the tier-2 fallback. */
-  tier2Enabled: boolean;
-  /** Tier-2 cross: real SOL reserve a coin must first reach. */
-  minRqSol2: number;
-  /** Slots to wait after the tier-2 cross when the coin never reaches tier 1. */
-  confirmDelay2: number;
-  /** Net buy SOL over (tier-2 cross, decision] required at entry. */
-  minFlowSol2: number;
-  /** Distinct non-creator buyers in (tier-2 cross, decision] required. */
-  minDistinctBuyers2: number;
-  /** Real SOL at decision must be at least this many bps of the tier-2 cross value. */
-  minRqGrowthBps2: number;
-  /** SOL to put into one tier-2 position (capped at 1% of real SOL). */
-  stakeSol2: number;
-  /** Smallest tier-2 buy worth sending (must stay >= 0.01 SOL guardrail floor). */
-  minBuySol2: number;
-  /** Tier-2 take profit (bps). Revised 2026-11-26: 500 -> 1000, so a tier-2
-   *  win clears round-trip fees (~3.5% of the 0.02 SOL stake) with a real
-   *  margin instead of keeping ~0.0003 SOL; see the header revision note. */
-  tpBps2: number;
-  /** Tier-2 stop loss (bps). */
-  slBps2: number;
-  /** Tier-2 max hold (slots). */
-  maxHold2: number;
-}
-
-export const DEFAULT_PARAMS: Params = {
-  minRqSol: 2,
-  confirmDelay: 1,
-  minFlowSol: 0,
-  minDistinctBuyers: 5,
-  minRqGrowthBps: 20000,
-  stakeSol: 0.2,
-  minBuySol: 0.02,
-  buySlipBps: 10000,
-  tpBps: 1500,
-  slBps: 1000,
-  trailArmBps: 100000,
-  trailBps: 1000,
-  maxHold: 8,
-  exitOnDevSell: true,
-  tier2Enabled: true,
-  minRqSol2: 0.4,
-  confirmDelay2: 1,
-  minFlowSol2: 0,
-  minDistinctBuyers2: 3,
-  minRqGrowthBps2: 24000,
-  stakeSol2: 0.02,
-  minBuySol2: 0.012,
-  tpBps2: 1000,
-  slBps2: 1000,
-  maxHold2: 8,
-};
-
-const FEE_BPS = 125n;
-
+/** One trade seen on a coin, kept for the buyer / flow windows. */
 interface Tick {
   slot: number;
-  isBuy: boolean;
-  sol: bigint;
-  user: Pubkey;
+  buy: boolean;
+  solLamports: bigint;
+  trader: Pubkey;
 }
 
-interface Coin {
+/** Everything remembered about one coin. */
+interface CoinMemory {
   mint: Pubkey;
-  createSlot: number;
   creator: Pubkey;
-  /** Slot the real SOL reserve first reached minRqSol (-1 = never). */
-  crossSlot: number;
-  /** Real SOL reserve (lamports) at the cross. */
-  crossRq: bigint;
-  /** Slot the real SOL reserve first reached minRqSol2 (-1 = never). */
-  cross2Slot: number;
-  /** Real SOL reserve (lamports) at the tier-2 cross. */
-  cross2Rq: bigint;
-  devSold: boolean;
-  recent: Tick[];
+  createdSlot: number;
+  ticks: Tick[];
+  /** Slot / reserve where the real SOL reserve first reached 2 SOL. */
+  strictCrossSlot: number | null;
+  strictCrossReserve: bigint;
+  /** Slot / reserve where the real SOL reserve first reached 0.4 SOL. */
+  looseCrossSlot: number | null;
+  looseCrossReserve: bigint;
+  creatorSold: boolean;
   entered: boolean;
-  done: boolean;
-  complete: boolean;
+  /** Marked once the coin is done with: window expired, sold, completed. */
+  settled: boolean;
+  /** A CompleteEvent arrived for this coin. */
+  finished: boolean;
+  /** Real SOL reserve from the latest trade seen on this coin. */
+  latestRealSol: bigint;
 }
 
-interface Held {
+/** Exit rules carried by one open position. */
+export interface ExitParams {
+  takeProfitBps: number;
+  stopLossBps: number;
+  maxHoldSlots: number;
+  exitOnCreatorSell: boolean;
+}
+
+/** One buying tier: how big, how strict, and how it exits. */
+export interface BuyTier extends ExitParams {
+  sizeLamports: bigint;
+  minSizeLamports: bigint;
+  /** Real SOL reserve that arms this tier. */
+  thresholdLamports: bigint;
+  minDistinctBuyers: number;
+  /** Reserve must reach this multiple of the crossing reserve (bps: 200 = 2.00x). */
+  reserveMultipleBps: number;
+}
+
+/** All tunable numbers of the strategy, in one table. */
+export interface StrategyParams {
+  strictTier: BuyTier;
+  looseTier: BuyTier;
+  /** Trailing rule arms once the peak reaches this multiple of cost (bps: 110000 = 11x). */
+  peakTriggerBps: number;
+  /** ...and fires once value has fallen to this share of the peak (bps: 9000 = 90%). */
+  pullbackKeepBps: number;
+  /** Curve fee charged on a sell, in basis points. */
+  curveFeeBps: number;
+}
+
+/** The default parameter table: the strict 0.2 SOL tier and the loose 0.02 SOL tier. */
+export const DEFAULT_PARAMS: StrategyParams = {
+  strictTier: {
+    sizeLamports: 200_000_000n,
+    minSizeLamports: 20_000_000n,
+    thresholdLamports: 2_000_000_000n,
+    minDistinctBuyers: 5,
+    reserveMultipleBps: 200,
+    takeProfitBps: 1500,
+    stopLossBps: 1000,
+    maxHoldSlots: 8,
+    exitOnCreatorSell: true,
+  },
+  looseTier: {
+    sizeLamports: 20_000_000n,
+    minSizeLamports: 12_000_000n,
+    thresholdLamports: 400_000_000n,
+    minDistinctBuyers: 3,
+    reserveMultipleBps: 240,
+    takeProfitBps: 1000,
+    stopLossBps: 1000,
+    maxHoldSlots: 8,
+    exitOnCreatorSell: true,
+  },
+  peakTriggerBps: 110000,
+  pullbackKeepBps: 9000,
+  curveFeeBps: 125,
+};
+
+/** The exit half of a tier, on its own. */
+export function exitOf(tier: BuyTier): ExitParams {
+  return {
+    takeProfitBps: tier.takeProfitBps,
+    stopLossBps: tier.stopLossBps,
+    maxHoldSlots: tier.maxHoldSlots,
+    exitOnCreatorSell: tier.exitOnCreatorSell,
+  };
+}
+
+/** One open position as the strategy remembers it. */
+interface PositionMemory {
   openedSlot: number;
-  txPaid: bigint;
-  best: bigint;
-  devSoldAtOpen: boolean;
-  /** Exit parameters of the tier that opened this position. */
-  tpBps: number;
-  slBps: number;
-  maxHold: number;
+  feesPaidLamports: bigint;
+  peakValueLamports: bigint;
+  exit: ExitParams;
+  creatorSoldAtEntry: boolean;
 }
 
-/** What selling `tokens` against (vq, vt) would pay after curve fees (95 + 30 bps). */
-function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
-  if (tokens <= 0n || vt <= 0n) return 0n;
-  const q = (tokens * vq) / (vt + tokens);
-  return q - (q * FEE_BPS + BPS - 1n) / BPS;
+const MAX_SLIPPAGE_BPS = 10_000;
+
+function minBigint(a: bigint, b: bigint): bigint {
+  return a < b ? a : b;
 }
 
-export function createStrategy(params: Params = DEFAULT_PARAMS) {
-  const P = params;
-  const coins = new Map<Pubkey, Coin>();
-  const held = new Map<Pubkey, Held>();
-  const selling = new Set<Pubkey>();
-  /** Exit parameters of the tier that placed a pending buy, by mint. */
-  const pendingTier = new Map<Pubkey, { tpBps: number; slBps: number; maxHold: number }>();
-  const minRq = BigInt(Math.floor(P.minRqSol * 1e9));
-  const minRq2 = BigInt(Math.floor(P.minRqSol2 * 1e9));
-  const stake = BigInt(Math.floor(P.stakeSol * 1e9));
-  const stake2 = BigInt(Math.floor(P.stakeSol2 * 1e9));
-  const minBuy = BigInt(Math.floor(P.minBuySol * 1e9));
-  const minBuy2 = BigInt(Math.floor(P.minBuySol2 * 1e9));
-  const minFlow = BigInt(Math.floor(P.minFlowSol * 1e9));
-  const minFlow2 = BigInt(Math.floor(P.minFlowSol2 * 1e9));
+function freshCoin(mint: Pubkey, creator: Pubkey, createdSlot: number): CoinMemory {
+  return {
+    mint,
+    creator,
+    createdSlot,
+    ticks: [],
+    strictCrossSlot: null,
+    strictCrossReserve: 0n,
+    looseCrossSlot: null,
+    looseCrossReserve: 0n,
+    creatorSold: false,
+    entered: false,
+    settled: false,
+    finished: false,
+    latestRealSol: 0n,
+  };
+}
 
-  function readEvents(batch: Batch): void {
-    for (const e of batch.events) {
-      if (e.event === 'CreateEvent') {
-        coins.set(e.mint, {
-          mint: e.mint,
-          createSlot: e.slot,
-          creator: e.creator,
-          crossSlot: -1,
-          crossRq: 0n,
-          cross2Slot: -1,
-          cross2Rq: 0n,
-          devSold: false,
-          recent: [],
-          entered: false,
-          done: false,
-          complete: false,
+/**
+ * The strategy itself. One instance lives for one run; its memory is the
+ * coins seen, the positions it believes it holds, the sells in flight, and
+ * which exit rules each pending buy belongs to.
+ */
+export class PumpFunStrategy {
+  readonly params: StrategyParams;
+  private readonly coins = new Map<Pubkey, CoinMemory>();
+  private readonly ledger = new Map<Pubkey, PositionMemory>();
+  private readonly selling = new Set<Pubkey>();
+  private readonly pendingTier = new Map<Pubkey, ExitParams>();
+
+  constructor(params: StrategyParams = DEFAULT_PARAMS) {
+    this.params = params;
+  }
+
+  /** Decide one batch: merge events, settle fills, prune, sell, then buy. */
+  onBatch(state: BotState, batch: Batch): OrderInput[] {
+    this.absorbEvents(batch.events);
+    this.absorbFills(batch.fills);
+    this.prune(state);
+    const orders: OrderInput[] = [];
+    orders.push(...this.planSells(state, batch));
+    orders.push(...this.planBuys(state, orders.length));
+    return orders;
+  }
+
+  // ------------------------------------------------------------ event intake
+
+  private absorbEvents(events: ChainEvent[]): void {
+    for (const event of events) {
+      if (event.event === "CreateEvent") {
+        if (!this.coins.has(event.mint)) {
+          this.coins.set(event.mint, freshCoin(event.mint, event.creator, event.slot));
+        }
+        continue;
+      }
+      if (event.event === "TradeEvent") {
+        let coin = this.coins.get(event.mint);
+        if (coin === undefined) {
+          coin = freshCoin(event.mint, event.creator, event.slot);
+          this.coins.set(event.mint, coin);
+        }
+        const realSol = BigInt(event.real_sol_reserves);
+        coin.latestRealSol = realSol;
+        coin.ticks.push({
+          slot: event.slot,
+          buy: event.is_buy,
+          solLamports: BigInt(event.sol_amount),
+          trader: event.user,
         });
-      } else if (e.event === 'TradeEvent') {
-        const c = coins.get(e.mint);
-        if (c === undefined) continue;
-        const sol = BigInt(e.sol_amount);
-        c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
-        if (c.crossSlot < 0 && BigInt(e.real_quote_reserves) >= minRq) {
-          c.crossSlot = e.slot;
-          c.crossRq = BigInt(e.real_quote_reserves);
+        if (coin.strictCrossSlot === null && realSol >= this.params.strictTier.thresholdLamports) {
+          coin.strictCrossSlot = event.slot;
+          coin.strictCrossReserve = realSol;
         }
-        if (P.tier2Enabled && c.cross2Slot < 0 && BigInt(e.real_quote_reserves) >= minRq2) {
-          c.cross2Slot = e.slot;
-          c.cross2Rq = BigInt(e.real_quote_reserves);
+        if (coin.looseCrossSlot === null && realSol >= this.params.looseTier.thresholdLamports) {
+          coin.looseCrossSlot = event.slot;
+          coin.looseCrossReserve = realSol;
         }
-        if (!e.is_buy && e.user === c.creator) c.devSold = true;
-      } else {
-        const c = coins.get(e.mint);
-        if (c !== undefined) {
-          c.complete = true;
-          c.done = true;
+        if (!event.is_buy && event.user === coin.creator) {
+          coin.creatorSold = true;
         }
+        continue;
+      }
+      // Any other event type ends the coin's tradable life.
+      let coin = this.coins.get(event.mint);
+      if (coin === undefined) {
+        coin = freshCoin(event.mint, event.user, event.slot);
+        this.coins.set(event.mint, coin);
+      }
+      coin.finished = true;
+      coin.settled = true;
+    }
+  }
+
+  // ------------------------------------------------------------ fill intake
+
+  private absorbFills(fills: Fill[]): void {
+    for (const fill of fills) {
+      // The harness's own closes only clean up: no position, no sell in flight.
+      if (fill.client_id.startsWith("_")) {
+        this.ledger.delete(fill.mint);
+        this.selling.delete(fill.mint);
+        continue;
+      }
+      if (fill.status === "rejected") continue;
+      const record = this.ledger.get(fill.mint);
+      if (record !== undefined) {
+        record.feesPaidLamports += BigInt(fill.tx_fee_lamports);
+      }
+      if (fill.side === "buy" && fill.status === "filled" && record === undefined) {
+        const coin = this.coins.get(fill.mint);
+        this.ledger.set(fill.mint, {
+          openedSlot: fill.slot,
+          feesPaidLamports: BigInt(fill.tx_fee_lamports),
+          peakValueLamports: 0n,
+          exit: this.pendingTier.get(fill.mint) ?? exitOf(this.params.strictTier),
+          creatorSoldAtEntry: coin?.creatorSold ?? false,
+        });
+        this.pendingTier.delete(fill.mint);
       }
     }
   }
 
-  /** Distinct non-creator buyers over (fromSlot, slot]. */
-  function distinctBuyers(c: Coin, fromSlot: number, slot: number): number {
+  // ------------------------------------------------------------ pruning
+
+  private hasPendingBuy(state: BotState, mint: Pubkey): boolean {
+    for (const pending of state.pending.values()) {
+      if (pending.order.side === "buy" && pending.order.mint === mint) return true;
+    }
+    return false;
+  }
+
+  private hasPendingSell(state: BotState, mint: Pubkey): boolean {
+    for (const pending of state.pending.values()) {
+      if (pending.order.side === "sell" && pending.order.mint === mint) return true;
+    }
+    return false;
+  }
+
+  private prune(state: BotState): void {
+    for (const mint of [...this.selling]) {
+      if (!this.hasPendingSell(state, mint)) this.selling.delete(mint);
+    }
+    for (const mint of [...this.ledger.keys()]) {
+      if (state.positions.has(mint)) continue;
+      if (this.selling.has(mint)) continue;
+      if (this.hasPendingBuy(state, mint)) continue;
+      this.ledger.delete(mint);
+    }
+  }
+
+  // ------------------------------------------------------------ windows
+
+  /** Net bought SOL in (startSlot, ...]: buys add, sells subtract, newest first. */
+  private netFlowSince(coin: CoinMemory, startSlot: number): bigint {
+    let total = 0n;
+    for (let i = coin.ticks.length - 1; i >= 0; i--) {
+      const tick = coin.ticks[i];
+      if (tick.slot <= startSlot) break;
+      total += tick.buy ? tick.solLamports : -tick.solLamports;
+    }
+    return total;
+  }
+
+  /** Distinct non-creator buyers in (startSlot, ...], newest first. */
+  private distinctBuyersSince(coin: CoinMemory, startSlot: number): number {
     const buyers = new Set<Pubkey>();
-    for (let i = c.recent.length - 1; i >= 0; i--) {
-      const t = c.recent[i]!;
-      if (t.slot <= fromSlot) break;
-      if (t.slot > slot) continue;
-      if (t.isBuy && t.user !== c.creator) buyers.add(t.user);
+    for (let i = coin.ticks.length - 1; i >= 0; i--) {
+      const tick = coin.ticks[i];
+      if (tick.slot <= startSlot) break;
+      if (tick.buy && tick.trader !== coin.creator) buyers.add(tick.trader);
     }
     return buyers.size;
   }
-  function flowSince(c: Coin, fromSlot: number, slot: number): bigint {
-    let net = 0n;
-    for (let i = c.recent.length - 1; i >= 0; i--) {
-      const t = c.recent[i]!;
-      if (t.slot <= fromSlot) break;
-      if (t.slot > slot) continue;
-      net += t.isBuy ? t.sol : -t.sol;
+
+  /** Strict tier: reserve, flow, buyer count and reserve multiple all hold. */
+  private strictReady(coin: CoinMemory): boolean {
+    if (coin.strictCrossSlot === null) return false;
+    const tier = this.params.strictTier;
+    if (coin.latestRealSol < tier.thresholdLamports) return false;
+    if (this.netFlowSince(coin, coin.strictCrossSlot) <= 0n) return false;
+    if (this.distinctBuyersSince(coin, coin.strictCrossSlot) < tier.minDistinctBuyers) return false;
+    return coin.latestRealSol * 100n >= coin.strictCrossReserve * BigInt(tier.reserveMultipleBps);
+  }
+
+  /** Loose tier: same shape, smaller numbers. */
+  private looseReady(coin: CoinMemory): boolean {
+    if (coin.looseCrossSlot === null) return false;
+    const tier = this.params.looseTier;
+    if (coin.latestRealSol < tier.thresholdLamports) return false;
+    if (this.netFlowSince(coin, coin.looseCrossSlot) <= 0n) return false;
+    if (this.distinctBuyersSince(coin, coin.looseCrossSlot) < tier.minDistinctBuyers) return false;
+    return coin.latestRealSol * 100n >= coin.looseCrossReserve * BigInt(tier.reserveMultipleBps);
+  }
+
+  // ------------------------------------------------------------ sells
+
+  private planSells(state: BotState, batch: Batch): OrderInput[] {
+    const orders: OrderInput[] = [];
+    const txFee = state.txFeeLamports();
+    const cap = state.hello.caps.max_orders_per_batch;
+    const marks = new Map(batch.marks.map((mark) => [mark.mint, mark]));
+    for (const [mint, position] of state.positions) {
+      if (orders.length >= cap) break;
+      if (this.selling.has(mint)) continue;
+      let record = this.ledger.get(mint);
+      if (record === undefined) {
+        const coin = this.coins.get(mint);
+        record = {
+          openedSlot: state.slot,
+          feesPaidLamports: txFee,
+          peakValueLamports: 0n,
+          exit: exitOf(this.params.strictTier),
+          creatorSoldAtEntry: coin?.creatorSold ?? false,
+        };
+        this.ledger.set(mint, record);
+      }
+      // Value this batch's mark first; fall back to the SDK's curve table.
+      const mark = marks.get(mint);
+      const curve = state.curves.get(mint);
+      const virtualTokens =
+        mark !== undefined ? BigInt(mark.virtual_token_reserves) : curve?.virtual_token_reserves;
+      const virtualQuote =
+        mark !== undefined ? BigInt(mark.virtual_quote_reserves) : curve?.virtual_quote_reserves;
+      if (virtualTokens === undefined || virtualQuote === undefined) continue;
+      const tokens = position.token_amount;
+      const gross = (tokens * virtualQuote) / (virtualTokens + tokens);
+      const curveFee = (gross * BigInt(this.params.curveFeeBps) + 9999n) / 10_000n;
+      const value = gross - curveFee - txFee;
+      const cost = position.cost_lamports + record.feesPaidLamports;
+      if (value > record.peakValueLamports) record.peakValueLamports = value;
+      const exit = record.exit;
+      const takeProfit = value * 10_000n >= cost * BigInt(10_000 + exit.takeProfitBps);
+      const stopLoss = value * 10_000n <= cost * BigInt(10_000 - exit.stopLossBps);
+      const trailing =
+        record.peakValueLamports * 10_000n >= cost * BigInt(this.params.peakTriggerBps) &&
+        value * 10_000n <= record.peakValueLamports * BigInt(this.params.pullbackKeepBps);
+      const heldTooLong = state.slot - record.openedSlot >= exit.maxHoldSlots;
+      const coin = this.coins.get(mint);
+      const creatorExit =
+        exit.exitOnCreatorSell && (coin?.creatorSold ?? false) && !record.creatorSoldAtEntry;
+      if (takeProfit || stopLoss || trailing || heldTooLong || creatorExit) {
+        orders.push({
+          side: "sell",
+          mint,
+          token_amount: tokens,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        });
+        this.selling.add(mint);
+        if (coin !== undefined) coin.settled = true;
+      }
     }
-    return net;
+    return orders;
   }
 
-  function hasPendingBuy(state: BotState, mint: Pubkey): boolean {
-    for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'buy') return true;
-    return false;
-  }
+  // ------------------------------------------------------------ buys
 
-  function hasPendingSell(state: BotState, mint: Pubkey): boolean {
-    for (const p of state.pending.values()) if (p.order.mint === mint && p.order.side === 'sell') return true;
-    return false;
-  }
-
-  return {
-    onBatch(state: BotState, batch: Batch): OrderInput[] {
-      readEvents(batch);
-      const orders: OrderInput[] = [];
-      const cap = state.hello.caps.max_orders_per_batch;
-      const tx = state.txFeeLamports();
-      const marks = new Map<Pubkey, { vq: bigint; vt: bigint }>();
-      for (const m of batch.marks) marks.set(m.mint, { vq: BigInt(m.virtual_quote_reserves), vt: BigInt(m.virtual_token_reserves) });
-
-      for (const f of batch.fills) {
-        if (f.client_id.startsWith('_')) {
-          held.delete(f.mint);
-          selling.delete(f.mint);
+  private planBuys(state: BotState, alreadyPlaced: number): OrderInput[] {
+    const orders: OrderInput[] = [];
+    const txFee = state.txFeeLamports();
+    const maxOrders = state.hello.caps.max_orders_per_batch;
+    const maxOpen = state.hello.caps.max_open_positions;
+    let cash = state.freeCashLamports();
+    let open = state.committedPositionCount();
+    for (const coin of this.coins.values()) {
+      if (open >= maxOpen) break;
+      if (orders.length + alreadyPlaced >= maxOrders) break;
+      if (coin.settled || coin.finished || coin.entered) continue;
+      // One-slot confirmation, then a three-slot window, per tier.
+      let strictWindow = false;
+      if (coin.strictCrossSlot !== null) {
+        if (state.slot < coin.strictCrossSlot + 1) continue;
+        if (state.slot > coin.strictCrossSlot + 3) {
+          coin.settled = true;
           continue;
         }
-        const h = held.get(f.mint);
-        if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
-        if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-          const t = pendingTier.get(f.mint) ?? { tpBps: P.tpBps, slBps: P.slBps, maxHold: P.maxHold };
-          pendingTier.delete(f.mint);
-          held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, devSoldAtOpen: coins.get(f.mint)?.devSold ?? false, tpBps: t.tpBps, slBps: t.slBps, maxHold: t.maxHold });
-        }
-      }
-      for (const mint of [...selling]) if (!hasPendingSell(state, mint)) selling.delete(mint);
-      for (const mint of [...held.keys()]) {
-        if (!state.positions.has(mint) && !selling.has(mint) && !hasPendingBuy(state, mint)) held.delete(mint);
-      }
-
-      // Exits first.
-      for (const [mint, pos] of state.positions) {
-        if (orders.length >= cap) break;
-        if (selling.has(mint)) continue;
-        const c = coins.get(mint);
-        let h = held.get(mint);
-        if (h === undefined) {
-          h = { openedSlot: state.slot, txPaid: tx, best: 0n, devSoldAtOpen: c?.devSold ?? false, tpBps: P.tpBps, slBps: P.slBps, maxHold: P.maxHold };
-          held.set(mint, h);
-        }
-        let mk = marks.get(mint);
-        if (mk === undefined) {
-          const cv = state.curves.get(mint);
-          if (cv === undefined) continue;
-          mk = { vq: cv.virtual_quote_reserves, vt: cv.virtual_token_reserves };
-        }
-        const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
-        const basis = pos.cost_lamports + h.txPaid;
-        if (value > h.best) h.best = value;
-        let exit = false;
-        if (basis > 0n) {
-          if (value * BPS >= basis * (BPS + BigInt(h.tpBps))) exit = true;
-          if (value * BPS <= basis * (BPS - BigInt(h.slBps))) exit = true;
-          if (h.best * BPS >= basis * (BPS + BigInt(P.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(P.trailBps))) exit = true;
-        }
-        if (state.slot - h.openedSlot >= h.maxHold) exit = true;
-        if (c !== undefined && P.exitOnDevSell && c.devSold && !h.devSoldAtOpen) exit = true;
-        if (!exit) continue;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10000 });
-        selling.add(mint);
-        if (c !== undefined) c.done = true;
-      }
-
-      // Entries. One decision per coin:
-      //   - if it reached the tier-1 threshold, decide at crossSlot + confirmDelay:
-      //     tier 1 first (full size), tier 2 as a same-slot fallback (small size);
-      //   - if it never reached tier 1, decide on the tier-2 cross + confirmDelay2.
-      // A failed test does NOT finish the coin: like the single-tier bot, it is
-      // re-tested on the next slots (the confirmation window keeps growing)
-      // until the slot passes the small decision window, and only then is the
-      // coin done. Collapsing this to one chance loses most entries.
-      let free = state.freeCashLamports();
-      let open = state.committedPositionCount();
-      for (const c of coins.values()) {
-        if (orders.length >= cap) break;
-        if (c.done || c.complete || c.entered) continue;
-        if (open >= state.hello.caps.max_open_positions) break;
-
-        let tier1Slot = false;
-        if (c.crossSlot >= 0) {
-          if (state.slot < c.crossSlot + P.confirmDelay) continue;
-          if (state.slot > c.crossSlot + P.confirmDelay + 2) {
-            c.done = true;
-            continue;
-          }
-          tier1Slot = true;
-        } else if (P.tier2Enabled && c.cross2Slot >= 0) {
-          if (state.slot < c.cross2Slot + P.confirmDelay2) continue;
-          if (state.slot > c.cross2Slot + P.confirmDelay2 + 2) {
-            c.done = true;
-            continue;
-          }
-        } else {
+        strictWindow = true;
+      } else if (coin.looseCrossSlot !== null) {
+        if (state.slot < coin.looseCrossSlot + 1) continue;
+        if (state.slot > coin.looseCrossSlot + 3) {
+          coin.settled = true;
           continue;
         }
-
-        const curve = state.curves.get(c.mint);
-        if (curve === undefined || curve.complete) continue;
-        if (hasPendingBuy(state, c.mint)) continue;
-
-        const rq = curve.real_quote_reserves;
-        // Tier 1: the proven strict filter.
-        if (
-          tier1Slot &&
-          rq >= minRq &&
-          flowSince(c, c.crossSlot, state.slot) > minFlow &&
-          distinctBuyers(c, c.crossSlot, state.slot) >= P.minDistinctBuyers &&
-          rq * BPS >= c.crossRq * BigInt(P.minRqGrowthBps)
-        ) {
-          const maxBuy = state.maxBuyLamports(c.mint);
-          const amount = stake < maxBuy ? stake : maxBuy;
-          if (amount >= minBuy && free >= amount + tx) {
-            orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: P.buySlipBps });
-            pendingTier.set(c.mint, { tpBps: P.tpBps, slBps: P.slBps, maxHold: P.maxHold });
-            free -= amount + tx;
-            c.entered = true;
-            open += 1;
-            continue;
-          }
-        }
-        // Tier 2: looser filter, small size, TP 10% (revised 2026-11-26 so
-        // a win clears round-trip fees). Confirmation is measured from the
-        // tier-2 cross (an earlier, lower threshold), so at a tier-1 decision
-        // slot its window is longer and it passes strictly more often.
-        if (
-          P.tier2Enabled &&
-          c.cross2Slot >= 0 &&
-          rq >= minRq2 &&
-          flowSince(c, c.cross2Slot, state.slot) > minFlow2 &&
-          distinctBuyers(c, c.cross2Slot, state.slot) >= P.minDistinctBuyers2 &&
-          rq * BPS >= c.cross2Rq * BigInt(P.minRqGrowthBps2)
-        ) {
-          const maxBuy = state.maxBuyLamports(c.mint);
-          const amount = stake2 < maxBuy ? stake2 : maxBuy;
-          if (amount >= minBuy2 && free >= amount + tx) {
-            orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: P.buySlipBps });
-            pendingTier.set(c.mint, { tpBps: P.tpBps2, slBps: P.slBps2, maxHold: P.maxHold2 });
-            free -= amount + tx;
-            c.entered = true;
-            open += 1;
-            continue;
-          }
-        }
-        // Failed this slot: leave undecided for a re-test on the next slot;
-        // the stale bound above finishes the coin once its window closes.
+      } else {
+        continue;
       }
-      return orders;
-    },
-  };
+      const curve = state.curves.get(coin.mint);
+      if (curve === undefined || curve.complete) continue;
+      if (this.hasPendingBuy(state, coin.mint)) continue;
+      // Strict tier first; if it cannot buy, fall through to the loose tier.
+      if (strictWindow && this.strictReady(coin)) {
+        const size = minBigint(this.params.strictTier.sizeLamports, state.maxBuyLamports(coin.mint));
+        if (size >= this.params.strictTier.minSizeLamports && cash >= size + txFee) {
+          orders.push({
+            side: "buy",
+            mint: coin.mint,
+            quote_lamports: size,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          });
+          this.pendingTier.set(coin.mint, exitOf(this.params.strictTier));
+          cash -= size + txFee;
+          coin.entered = true;
+          open += 1;
+          continue;
+        }
+      }
+      if (this.looseReady(coin)) {
+        const size = minBigint(this.params.looseTier.sizeLamports, state.maxBuyLamports(coin.mint));
+        if (size >= this.params.looseTier.minSizeLamports && cash >= size + txFee) {
+          orders.push({
+            side: "buy",
+            mint: coin.mint,
+            quote_lamports: size,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          });
+          this.pendingTier.set(coin.mint, exitOf(this.params.looseTier));
+          cash -= size + txFee;
+          coin.entered = true;
+          open += 1;
+        }
+      }
+    }
+    return orders;
+  }
+}
+
+/**
+ * Build a strategy from a parameter table. Called with no arguments it
+ * builds the default-parameter strategy main.ts runs.
+ */
+export function createPumpFunStrategy(params: StrategyParams = DEFAULT_PARAMS): PumpFunStrategy {
+  return new PumpFunStrategy(params);
+}
+
+/** Short alias for the factory. */
+export function createStrategy(params: StrategyParams = DEFAULT_PARAMS): PumpFunStrategy {
+  return new PumpFunStrategy(params);
 }
