@@ -4,7 +4,7 @@
 //
 // Ranking here is hourly Sharpe on a 6-hour final window, not raw PnL, and the
 // guardrail needs a >= 0.01 SOL round trip on >= 20 distinct mints inside
-// those 6 hours. strategy.ts therefore runs two tiers: a strict full-size
+// those 6 hours, so breadth matters as much as edge. strategy.ts therefore runs two tiers: a strict full-size
 // tier that carries the PnL, and a small-size looser tier that supplies the
 // distinct-mint count and steadies the hourly PnL. Revised 2026-11-26 after
 // the competition opened: tier-2 take profit 500 -> 1000 bps (10%), because
@@ -24,5 +24,5 @@ import { createStrategy, DEFAULT_PARAMS } from './strategy.ts';
 // ~0.0003 SOL after ~0.0007 SOL round-trip fees while a 10% stop-loss gives
 // back the full 0.002 SOL, so the win/loss payoff was ~1:7 against the bot;
 // a 10% TP restores payoff symmetry and lets tier-2 winners actually
-// contribute to hourly Sharpe instead of churning fees. See strategy.ts.
+// contribute to hourly Sharpe instead of churning fees on small stakes. See strategy.ts.
 await runBot(createStrategy(DEFAULT_PARAMS));

@@ -23,7 +23,7 @@
 // Sharpe note: the rank key is mean/std of the 6 hourly equity returns of the
 // final window (not annualized). Small, frequent, similarly-sized trades in
 // every hour beat one lucky moonshot: tier 2 also steadies the hourly PnL by
-// trading in hours where tier 1 finds nothing. Exits are fast on both tiers
+// trading in hours where tier 1 finds nothing, keeping every hour active. Exits are fast on both tiers
 // (<= 8 slots) so almost no position is open at an hour boundary and the
 // hourly equity is essentially realized PnL.
 //
@@ -405,7 +405,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
           }
         }
         // Failed this slot: leave undecided for a re-test on the next slot;
-        // the stale bound above finishes the coin.
+        // the stale bound above finishes the coin once its window closes.
       }
       return orders;
     },
